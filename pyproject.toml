@@ -1,0 +1,18 @@
+[project]
+name = "minidiffullama"
+version = "0.1.0"
+description = "Minimal diffusion LM training/eval with TinyLLaMA-style packed datasets."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate",
+  "datasets",
+  "numpy",
+  "torch",
+  "transformers",
+]
+
+[project.optional-dependencies]
+flash-attn = [
+  "flash-attn==2.6.3",
+]
