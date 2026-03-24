@@ -67,7 +67,6 @@ python scripts/prepare_slimpajama.py \
   --split train \
   --percentage 1.0
 ```
-citeturn1view0
 
 ## Train (DDP with Accelerate)
 
