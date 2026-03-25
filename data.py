@@ -190,18 +190,25 @@ def build_packed_dataloader(
     """
     Loads TinyLLaMA-style packed binary shards from `packed_dir`.
     Each shard is a .bin file produced by TinyLLaMA preprocessing, containing a
-    contiguous stream of token IDs. The shard filename prefix (e.g., "train_slim")
+    contiguous stream of token IDs. The shard filename prefix (e.g., "train_parquet")
     selects which subset to read. We memmap the shards and yield fixed-length
     blocks (`block_size`) for training.
     """
     datasets = []
     if not prefixes:
-        prefixes = ["train_slim", "train_star"]
+        prefixes = ["train_parquet"]
     if not weights:
         weights = [1.0 / len(prefixes)] * len(prefixes)
+    if len(weights) != len(prefixes):
+        raise ValueError(f"weights length {len(weights)} must match prefixes length {len(prefixes)}")
 
     for prefix in prefixes:
-        filenames = sorted(glob.glob(str(packed_dir / f"{prefix}*")))
+        filenames = sorted(glob.glob(str(packed_dir / f"{prefix}*.bin")))
+        if not filenames:
+            raise RuntimeError(
+                f"No packed .bin files found at {packed_dir} for prefix {prefix!r}. "
+                f"Pass --packed-prefixes explicitly if your shard names use a different prefix."
+            )
         random.seed(seed)
         random.shuffle(filenames)
         dataset = PackedDataset(
@@ -214,9 +221,6 @@ def build_packed_dataloader(
             process_rank=process_rank,
         )
         datasets.append(dataset)
-
-    if not datasets:
-        raise RuntimeError(f"No packed data found at {packed_dir} with prefixes {prefixes}")
 
     s = sum(weights)
     weights = [w / s for w in weights]

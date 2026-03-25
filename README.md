@@ -1,6 +1,6 @@
 # miniDiffuLLaMA
 
-Minimal diffusion-LM training and eval using TinyLLaMA-style packed datasets.
+Minimal diffusion-LM training and eval using TinyLLaMA-style packed datasets. E.g. it can use meta-llama/Llama-2-7b-hf autoregressive LLM to be changed into a diffusion-LM.
 
 ## Setup (uv)
 
@@ -13,60 +13,67 @@ source .venv/bin/activate
 uv sync
 ```
 
-If you need Flash Attention 2 (optional, GPU only):
+If you need Flash Attention 2, depending on your system use:
 
 ```bash
-uv sync --extra flash-attn
+export TORCH=torch2.6
+export CXX=cxx11abiFALSE
+
+uv pip install "flash-attn==2.7.4.post1" \
+  --extra-index-url https://thomasjpfan.github.io/flash-attn-whl/cu12/$TORCH/$CXX \
+  --no-cache-dir
 ```
 
 ## Data (packed .bin shards)
 
-This pipeline expects pre-tokenized, packed binary shards produced by the
-TinyLLaMA preprocessing scripts. Each shard is a contiguous stream of token IDs
-with a small header. Shard filenames use prefixes to define subsets (e.g.,
-`train_slim_*`, `train_star_*`).
+This pipeline expects pre-tokenized, packed binary shards with the same `LITPKDS`
+format used by TinyLLaMA. Shard filenames use prefixes to define subsets
+for training, for example `train_parquet_*`.
 
 Expected folder layout:
 
 ```
 /path/to/packed_data/
-  train_slim_0000000000.bin
-  train_slim_0000000001.bin
-  train_star_0000000000.bin
-  train_star_0000000001.bin
+  train_parquet_0_0000000000.bin
+  train_parquet_0_0000000001.bin
+  train_parquet_1_0000000000.bin
 ```
 
-To build these shards, follow TinyLLaMA preprocessing. Example (from their docs):
+To build these shards from parquet files in this repo, use
+`data_prep.py`. It reads parquet rows in batches, tokenizes a
+text column with a Hugging Face tokenizer, appends EOS by default, and packs the
+result into fixed-size TinyLLaMA-style `.bin` shards. Work is split across
+multiple processes by parquet file.
+
+Example download command for a parquet shard:
 
 ```bash
-# Download datasets (large: SlimPajama ~893GB, Starcoderdata ~290GB)
-cd /path/to/dataset
-git lfs install
-git clone https://huggingface.co/datasets/cerebras/SlimPajama-627B
-git clone https://huggingface.co/datasets/bigcode/starcoderdata
-
-# Tokenize + pack into TinyLLaMA-style .bin shards
-python scripts/prepare_starcoder.py \
-  --source_path /path/to/starcoderdata/ \
-  --tokenizer_path data/llama \
-  --destination_path data/slim_star_combined \
-  --split train \
-  --percentage 1.0
-
-python scripts/prepare_slimpajama.py \
-  --source_path /path/to/SlimPajama \
-  --tokenizer_path data/llama \
-  --destination_path data/slim_star_combined \
-  --split validation \
-  --percentage 1.0
-
-python scripts/prepare_slimpajama.py \
-  --source_path /path/to/SlimPajama \
-  --tokenizer_path data/llama \
-  --destination_path data/slim_star_combined \
-  --split train \
-  --percentage 1.0
+hf download gmongaras/SlimPajama-627B_Reupload --repo-type dataset --include "data/train-00002*" --local-dir ./data
 ```
+
+Example for running the tokenizer:
+
+```bash
+cd ./miniDiffuLLaMA
+
+.venv/bin/python data_prep.py \
+  --source-path ../data/data \
+  --tokenizer <hf_or_local_tokenizer> \
+  --destination-path ../data/packed_data \
+  --prefix train_parquet \
+  --pattern *.parquet \
+  --num-processes 2
+```
+
+Useful flags:
+
+- `--text-column`: explicitly choose the parquet text column. If omitted, the
+  script tries `text`, `content`, `body`, then falls back to the first string column.
+- `--percentage`: process only a fraction of the parquet files.
+- `--skip-redpajama-github`: skip rows where `meta.redpajama_set_name == "RedPajamaGithub"`.
+- `--write-remainder`: write the final partial shard. By default it is dropped,
+  matching TinyLLaMA behavior.
+- `--no-eos`: disable automatic EOS appending.
 
 ## Train (DDP with Accelerate)
 
@@ -83,15 +90,95 @@ accelerate launch --num_processes 4 \
   --gradient-accumulate-every 8 \
   --max-train-steps 20000 \
   --learning-rate 1.5e-5 \
-  --output-dir ./output/mini_diffullama
+  --output-dir /path/to/runs/mini_diffullama \
+  --checkpoint-dir /path/to/runs/mini_diffullama/checkpoints \
+  --save-every 500 \
+  --eval-every 500 \
+  --packed-prefixes train_parquet \
+  --eval-tasks hellaswag,winogrande,piqa,siqa \
+  --wandb-project miniDiffuLLaMA
+```
+
+Attention-mask mode notes:
+
+- If you want properly interpolated attention between causal and full attention, use `--attn-impl sdpa`. In this mode the training code applies the custom 4D annealed mask.
+- If you want to use FlashAttention 2, use `--attn-impl flash_attention_2`. In this mode the training code skips the annealed 4D mask and switches the model to immediate non-causal attention.
+
+Example with interpolated attention via SDPA:
+
+```bash
+accelerate launch --num_processes 1 train.py   --model <hf_or_local_model>   --packed-data-dir /path/to/packed_data   --packed-prefixes train_parquet   --attn-impl sdpa
+```
+
+Example with FlashAttention 2 and immediate non-causal attention:
+
+```bash
+accelerate launch --num_processes 1 train.py   --model <hf_or_local_model>   --packed-data-dir /path/to/packed_data   --packed-prefixes train_parquet   --attn-impl flash_attention_2
 ```
 
 If you want to control dataset mixing, pass prefixes and weights:
 
 ```bash
---packed-prefixes train_slim,train_star \
---packed-weights 0.7,0.3
+--packed-prefixes train_parquet \
+--packed-weights 1.0
 ```
+
+Additional training outputs:
+
+- `--checkpoint-dir`: periodic checkpoints are written here as `step_00000500/`, `step_00001000/`, etc. If omitted, checkpoints default to `<output-dir>/checkpoints`.
+- `--save-every`: checkpoint cadence in optimizer steps. `0` disables periodic checkpoints.
+- `--eval-every`: evaluation cadence in optimizer steps. `0` disables scheduled evals.
+- `--eval-tasks`: choose which evals to run during scheduled evaluation. The default is `hellaswag,winogrande,piqa,siqa`.
+- `--eval-history-path`: JSONL file where scheduled eval metrics are appended. If omitted, defaults to `<output-dir>/eval_history.jsonl`.
+
+Example output layout with `--output-dir /path/to/runs/mini_diffullama`:
+
+```text
+/path/to/runs/mini_diffullama/
+  config.json
+  generation_config.json
+  model.safetensors or pytorch_model.bin
+  tokenizer.json
+  tokenizer_config.json
+  special_tokens_map.json
+  checkpoints/
+    step_00000500/
+    step_00001000/
+  eval_history.jsonl
+```
+
+In other words:
+
+- `output_dir` holds the final exported model and tokenizer at the end of training.
+- `output_dir/checkpoints/` is the default periodic checkpoint location if `--checkpoint-dir` is not set.
+- `output_dir/eval_history.jsonl` is the default scheduled-eval log if `--eval-history-path` is not set.
+
+### W&B reminder
+
+`wandb` is now a project dependency, but you still need to authenticate before logging:
+
+```bash
+source .venv/bin/activate
+wandb login
+```
+
+You can also set the API key non-interactively:
+
+```bash
+export WANDB_API_KEY=<your_api_key>
+```
+
+Useful W&B flags:
+
+- `--wandb-project`: required to enable W&B logging.
+- `--wandb-entity`: optional team or user namespace.
+- `--wandb-run-name`: optional custom run name.
+- `--wandb-dir`: optional local directory for W&B metadata.
+
+What gets logged:
+
+- `train/loss` every optimizer step.
+- `eval/*` metrics every `--eval-every` steps.
 
 ## Eval (multiple-choice + generation)
 
@@ -116,9 +203,18 @@ python eval.py \
   --gen-length 28
 ```
 
+To print a checkpoint-by-metric table from the eval history JSONL:
+
+```bash
+python eval.py \
+  --history-paths /path/to/runs/mini_diffullama/eval_history.jsonl
+```
+
+This prints a table with rows as eval metrics and columns as checkpoints.
+
 Notes:
 - `train.py` uses a diffusion masking objective with annealed attention.
-- `eval.py` scores options by denoising loss; lower loss = better.
+- `eval.py` uses denoising-loss scoring for multiple-choice tasks, and generation-based evaluation for tasks like Lambada and poem reverse.
 
 ## Packed dataset mechanics (how data is streamed)
 
@@ -137,13 +233,13 @@ Key pieces:
   - Shuffles block indices **within the loaded buffer** (fast, memory-bounded).
   - Yields one block of length `block_size` per `__next__`.
   - When the buffer is exhausted, it loads the next `n_chunks` files.
-- **`CombinedDataset`**: mixes multiple packed streams (e.g., `train_slim` and
-  `train_star`) by weighted sampling on each `next()` call.
+- **`CombinedDataset`**: mixes multiple packed streams by weighted sampling on
+  each `next()` call.
 
 This gives you:
-1) **No padding waste** (all blocks are full).
-2) **Low RAM usage** (memmap + small buffer).
-3) **Scalable sharding** across multiple GPUs/workers.
+1. **No padding waste** (all blocks are full).
+2. **Low RAM usage** (memmap + small buffer).
+3. **Scalable sharding** across multiple GPUs/workers.
 
 ## Sources and inspiration
 
@@ -153,7 +249,4 @@ This mini pipeline is distilled from the following sources in this repo and rela
   See `DiffuLLaMA-training/train.py` and `DiffuLLaMA-training/README.md`.
 - **LLaMA-Factory (DiffuLLaMA fork)**: DDM training setup and evaluation approach.
   See `LLaMA-Factory/src/llamafactory/train/ddm/`.
-- **TinyLLaMA**: packed binary dataset format and preprocessing pipeline.
-  Our packed dataloader follows the TinyLLaMA PRETRAIN instructions and
-  the `PackedDataset` design in `DiffuLLaMA-training/packed_dataset.py`
-  (which is explicitly noted as inspired by Fairseq/Megatron in its header).
+- **TinyLLaMA**: packed binary dataset format that this repo reads and writes.

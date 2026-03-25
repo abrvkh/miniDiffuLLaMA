@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from train import get_anneal_attn_mask
+from attention import get_anneal_attn_mask
 
 
 def eval_forward(
@@ -134,14 +134,7 @@ def build_prompt_completion(
     return input_ids_t, src_mask_t, len(prompt_ids)
 
 
-def eval_hellaswag(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> None:
-    """
-    HellaSwag multiple-choice evaluation (HF dataset).
-
-    Data source: load_dataset("Rowan/hellaswag", split="validation").
-    Scoring: for each option, compute denoising loss on the option tokens given
-    the context. Pick the option with lowest loss.
-    """
+def eval_hellaswag(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> float:
     ds = load_dataset("Rowan/hellaswag", split="validation")
     if max_samples is not None:
         ds = ds.select(range(max_samples))
@@ -165,17 +158,10 @@ def eval_hellaswag(model, tokenizer, diffusion_steps: int, shift: bool, max_samp
         pred = int(min(range(len(scores)), key=lambda i: scores[i]))
         correct += int(pred == label)
         total += 1
-    print("hellaswag_acc:", correct / max(1, total))
+    return correct / max(1, total)
 
 
-def eval_lambada(model, tokenizer, diffusion_steps: int, shift: bool, lambada_path: Path) -> None:
-    """
-    Lambada next-word accuracy.
-
-    Data source: local plain-text file (one sentence per line).
-    We mask the final word(s) and generate with diffusion decoding; prediction
-    is correct if the generated suffix matches the true final word.
-    """
+def eval_lambada(model, tokenizer, diffusion_steps: int, shift: bool, lambada_path: Path) -> float:
     if not lambada_path.exists():
         raise FileNotFoundError(f"Lambada file not found: {lambada_path}")
 
@@ -197,16 +183,10 @@ def eval_lambada(model, tokenizer, diffusion_steps: int, shift: bool, lambada_pa
             pred = tokenizer.decode(res.tolist()[0][-masked_nums:]).strip()
             if pred == line.split()[-1].strip():
                 correct += 1
-    print("lambada_acc:", correct / max(1, total_cnt))
+    return correct / max(1, total_cnt)
 
 
-def eval_winogrande(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> None:
-    """
-    Winogrande multiple-choice evaluation (HF dataset).
-
-    Data source: load_dataset("allenai/winogrande", "winogrande_xl", split="validation").
-    Scoring: denoising loss on the option tokens given the prefix.
-    """
+def eval_winogrande(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> float:
     ds = load_dataset("allenai/winogrande", "winogrande_xl", split="validation", trust_remote_code=True)
     if max_samples is not None:
         ds = ds.select(range(max_samples))
@@ -230,16 +210,10 @@ def eval_winogrande(model, tokenizer, diffusion_steps: int, shift: bool, max_sam
         pred = int(min(range(len(scores)), key=lambda i: scores[i]))
         correct += int(pred == label)
         total += 1
-    print("winogrande_acc:", correct / max(1, total))
+    return correct / max(1, total)
 
 
-def eval_piqa(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> None:
-    """
-    PIQA multiple-choice evaluation (HF dataset).
-
-    Data source: load_dataset("ybisk/piqa", split="validation").
-    Scoring: denoising loss on the option tokens given the goal.
-    """
+def eval_piqa(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> float:
     ds = load_dataset("ybisk/piqa", split="validation", trust_remote_code=True)
     if max_samples is not None:
         ds = ds.select(range(max_samples))
@@ -263,16 +237,10 @@ def eval_piqa(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: 
         pred = int(min(range(len(scores)), key=lambda i: scores[i]))
         correct += int(pred == label)
         total += 1
-    print("piqa_acc:", correct / max(1, total))
+    return correct / max(1, total)
 
 
-def eval_siqa(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> None:
-    """
-    Social IQa multiple-choice evaluation (HF dataset).
-
-    Data source: load_dataset("allenai/social_i_qa", split="validation").
-    Scoring: denoising loss on the option tokens given the prompt.
-    """
+def eval_siqa(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: Optional[int]) -> float:
     ds = load_dataset("allenai/social_i_qa", split="validation", trust_remote_code=True)
     if max_samples is not None:
         ds = ds.select(range(max_samples))
@@ -296,7 +264,7 @@ def eval_siqa(model, tokenizer, diffusion_steps: int, shift: bool, max_samples: 
         pred = int(min(range(len(scores)), key=lambda i: scores[i]))
         correct += int(pred == label)
         total += 1
-    print("siqa_acc:", correct / max(1, total))
+    return correct / max(1, total)
 
 
 def eval_poem_reverse(
@@ -307,14 +275,7 @@ def eval_poem_reverse(
     gen_length: int,
     poem_path: Path,
     direction: str,
-) -> None:
-    """
-    Poem reverse task adapted from ML-GSAI/LLaDA eval_reverse.py.
-    Expects a JSON list with fields: {"first": ..., "second": ...}.
-
-    Data source: local file at miniDiffuLLaMA/eval_data/poem_data.json.
-    Task: given one line, generate the other line via masked completion.
-    """
+) -> float:
     if not poem_path.exists():
         raise FileNotFoundError(f"Poem data not found: {poem_path}")
     with poem_path.open("r", encoding="utf-8") as f:
@@ -340,10 +301,139 @@ def eval_poem_reverse(
         gen_text = tokenizer.decode(out[0, prompt_len:], skip_special_tokens=True)
         if answer in gen_text:
             acc += 1
-    print("poem_reverse_acc:", acc / max(1, len(prompts)))
+    return acc / max(1, len(prompts))
+
+
+def run_evals(
+    model,
+    tokenizer,
+    tasks: list[str],
+    diffusion_steps: int,
+    shift: bool,
+    max_samples: Optional[int],
+    lambada_path: Path,
+    poem_path: Path,
+    poem_direction: str,
+    gen_length: int,
+    print_results: bool = True,
+) -> dict[str, float]:
+    metrics = {}
+    for task in tasks:
+        if task == "lambada":
+            metrics["lambada_acc"] = eval_lambada(
+                model,
+                tokenizer,
+                diffusion_steps,
+                shift,
+                lambada_path=lambada_path,
+            )
+        elif task == "hellaswag":
+            metrics["hellaswag_acc"] = eval_hellaswag(model, tokenizer, diffusion_steps, shift, max_samples)
+        elif task == "winogrande":
+            metrics["winogrande_acc"] = eval_winogrande(model, tokenizer, diffusion_steps, shift, max_samples)
+        elif task == "piqa":
+            metrics["piqa_acc"] = eval_piqa(model, tokenizer, diffusion_steps, shift, max_samples)
+        elif task == "siqa":
+            metrics["siqa_acc"] = eval_siqa(model, tokenizer, diffusion_steps, shift, max_samples)
+        elif task == "poem_reverse":
+            metrics["poem_reverse_acc"] = eval_poem_reverse(
+                model,
+                tokenizer,
+                diffusion_steps,
+                shift,
+                gen_length=gen_length,
+                poem_path=poem_path,
+                direction=poem_direction,
+            )
+        else:
+            raise ValueError(f"Unknown eval task: {task}")
+
+    if print_results:
+        for name, value in sorted(metrics.items()):
+            print(f"{name}: {value:.6f}")
+    return metrics
+
+
+def load_eval_records(paths: list[Path]) -> list[dict]:
+    records = []
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Eval history not found: {path}")
+
+        if path.suffix == ".jsonl":
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+            continue
+
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        if isinstance(payload, list):
+            records.extend(payload)
+        elif isinstance(payload, dict) and "records" in payload and isinstance(payload["records"], list):
+            records.extend(payload["records"])
+        else:
+            raise ValueError(f"Unsupported eval history format in {path}")
+
+    return sorted(records, key=lambda record: int(record.get("step", 0)))
+
+
+def build_checkpoint_metric_table(records: list[dict]) -> tuple[list[str], list[list[str]]]:
+    if not records:
+        raise ValueError("No evaluation records found.")
+
+    metric_names = sorted({name for record in records for name in record.get("metrics", {}).keys()})
+    checkpoints = []
+    for record in records:
+        step = int(record.get("step", 0))
+        checkpoint = record.get("checkpoint")
+        label = Path(checkpoint).name if checkpoint else f"step_{step:08d}"
+        checkpoints.append((label, record))
+
+    headers = ["eval"] + [label for label, _ in checkpoints]
+    rows = []
+    for metric_name in metric_names:
+        row = [metric_name]
+        for _, record in checkpoints:
+            value = record.get("metrics", {}).get(metric_name)
+            row.append("" if value is None else f"{float(value):.4f}")
+        rows.append(row)
+    return headers, rows
+
+
+def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [len(str(cell)) for cell in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(str(cell)))
+
+    def render(row: list[str]) -> str:
+        return " | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row))
+
+    separator = "-+-".join("-" * width for width in widths)
+    print(render(headers))
+    print(separator)
+    for row in rows:
+        print(render(row))
+
+
+def print_eval_history_table(paths: list[Path]) -> None:
+    headers, rows = build_checkpoint_metric_table(load_eval_records(paths))
+    print_table(headers, rows)
 
 
 def main(args: argparse.Namespace) -> None:
+    if args.history_paths:
+        paths = [Path(path.strip()) for path in args.history_paths.split(",") if path.strip()]
+        print_eval_history_table(paths)
+        return
+
+    if args.model is None:
+        raise ValueError("--model is required unless --history-paths is used.")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -353,40 +443,30 @@ def main(args: argparse.Namespace) -> None:
     model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
-    for task in tasks:
-        if task == "lambada":
-            eval_lambada(
-                model,
-                tokenizer,
-                args.diffusion_steps,
-                args.shift,
-                lambada_path=Path(args.lambada_path),
-            )
-        elif task == "hellaswag":
-            eval_hellaswag(model, tokenizer, args.diffusion_steps, args.shift, args.eval_max_samples)
-        elif task == "winogrande":
-            eval_winogrande(model, tokenizer, args.diffusion_steps, args.shift, args.eval_max_samples)
-        elif task == "piqa":
-            eval_piqa(model, tokenizer, args.diffusion_steps, args.shift, args.eval_max_samples)
-        elif task == "siqa":
-            eval_siqa(model, tokenizer, args.diffusion_steps, args.shift, args.eval_max_samples)
-        elif task == "poem_reverse":
-            eval_poem_reverse(
-                model,
-                tokenizer,
-                args.diffusion_steps,
-                args.shift,
-                gen_length=args.gen_length,
-                poem_path=Path(args.poem_path),
-                direction=args.poem_direction,
-            )
-        else:
-            raise ValueError(f"Unknown eval task: {task}")
+    metrics = run_evals(
+        model,
+        tokenizer,
+        tasks,
+        args.diffusion_steps,
+        args.shift,
+        args.eval_max_samples,
+        lambada_path=Path(args.lambada_path),
+        poem_path=Path(args.poem_path),
+        poem_direction=args.poem_direction,
+        gen_length=args.gen_length,
+        print_results=True,
+    )
+    if args.results_json is not None:
+        output_path = Path(args.results_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"step": args.step, "checkpoint": args.checkpoint_label, "metrics": metrics}
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--attn-impl", type=str, default="flash_attention_2")
     parser.add_argument("--diffusion-steps", type=int, default=64)
     parser.add_argument("--shift", action="store_true")
@@ -396,4 +476,8 @@ if __name__ == "__main__":
     parser.add_argument("--poem-path", type=str, default="eval_data/poem_data.json")
     parser.add_argument("--poem-direction", type=str, default="ftb", choices=["ftb", "btf"])
     parser.add_argument("--gen-length", type=int, default=28)
+    parser.add_argument("--results-json", type=str, default=None)
+    parser.add_argument("--step", type=int, default=None)
+    parser.add_argument("--checkpoint-label", type=str, default=None)
+    parser.add_argument("--history-paths", type=str, default=None)
     main(parser.parse_args())
